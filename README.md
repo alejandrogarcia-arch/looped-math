@@ -73,12 +73,18 @@ python check_env.py
 
 ---
 
-## 3. Verificación rápida
+## 3. Verificación rápida y Benchmark de Hardware
 
-Para ejecutar los tests de corrección del modelo y datos:
+Para ejecutar los tests de corrección del modelo:
 
 ```bash
 pytest -v
+```
+
+Para generar la tabla de parámetros y FLOPs (`figures/model_params_flops.md` y `.tex`) y medir la memoria VRAM y velocidad por paso en tu máquina (`figures/benchmark_vram_speed.md`):
+
+```bash
+python -m src.benchmark
 ```
 
 ---
