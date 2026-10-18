@@ -11,12 +11,14 @@ import torch.nn as nn
 
 DEFAULT_MODEL_CFG: Dict[str, Any] = {
     "arch": "looped",          # "gpt" | "looped"
-    "vocab_size": 100,         # Tamaño del vocabulario de caracteres
+    "vocab_size": 97,          # Tamaño del vocabulario fijo de caracteres (Sección 2.3)
     "context_length": 512,     # Longitud máxima de secuencia
     "emb_dim": 256,            # Dimensión del estado oculto (d)
     "n_heads": 8,              # Número de cabezas de atención (head_dim = 32)
-    "n_layers": 1,             # Bloques con pesos distintos (L en GPT, 1 en Looped)
+    "n_layers": 1,             # Bloques con pesos distintos (L en GPT, k=1 en Looped)
+    "n_unique_layers": 1,      # Alias de n_layers para explicitar k bloques únicos en Looped
     "n_loops": 4,              # Iteraciones del bucle recurrente (N en Looped)
+    "input_injection": False,  # Suma opcional del embedding inicial h_0 en cada iteración t > 0
     "drop_rate": 0.0,          # Sin dropout sobre datos sintéticos
     "qkv_bias": False,         # Sin sesgo en las proyecciones Q, K, V
 }
@@ -208,46 +210,77 @@ class GPTModel(nn.Module):
         return_attn: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, List[torch.Tensor]]]]:
         x = self.embed(in_idx)
-        hidden_states: List[torch.Tensor] = [x] if return_hidden else []
-        attn_maps: List[torch.Tensor] = []
+        if not return_hidden and not return_attn:
+            for block in self.trf_blocks:
+                x = block(x, return_attn=False)
+            return self.head(x)
+
+        extras: Dict[str, List[torch.Tensor]] = {}
+        if return_hidden:
+            extras["hidden"] = [x]
+        if return_attn:
+            extras["attn"] = []
 
         for block in self.trf_blocks:
             if return_attn:
                 x, attn_w = block(x, return_attn=True)
-                attn_maps.append(attn_w)
+                extras["attn"].append(attn_w)
             else:
                 x = block(x, return_attn=False)
             if return_hidden:
-                hidden_states.append(x)
+                extras["hidden"].append(x)
 
-        logits = self.head(x)
-        if return_hidden or return_attn:
-            extras: Dict[str, List[torch.Tensor]] = {}
-            if return_hidden:
-                extras["hidden"] = hidden_states
-            if return_attn:
-                extras["attn"] = attn_maps
-            return logits, extras
-        return logits
+        return self.head(x), extras
 
 
 class LoopedGPT(GPTModel):
     """
-    Looped Transformer que hereda de GPTModel y aplica sus bloques de forma
+    Looped Transformer que hereda de GPTModel y aplica sus k bloques de forma
     recurrente durante N iteraciones (con pesos compartidos entre vueltas).
     """
 
     def __init__(self, cfg: Dict[str, Any]) -> None:
         full_cfg = {**DEFAULT_MODEL_CFG, **cfg}
-        super().__init__(full_cfg)
-        self.cfg = full_cfg
-        self.n_layers = int(full_cfg["n_layers"])
+        if "n_unique_layers" in cfg:
+            k_blocks = int(cfg["n_unique_layers"])
+        elif "n_layers" in cfg:
+            k_blocks = int(cfg["n_layers"])
+        else:
+            k_blocks = 1
+
         self.n_loops = int(full_cfg["n_loops"])
+        self.n_unique_layers = k_blocks
+        self.n_layers = k_blocks
+        self.input_injection = bool(full_cfg.get("input_injection", False))
+
+        full_cfg["n_layers"] = k_blocks
+        full_cfg["n_unique_layers"] = k_blocks
+        super().__init__(full_cfg)
+        self.cfg = copy.deepcopy(full_cfg)
 
     @property
     def shared_blocks(self) -> nn.Sequential:
-        """Alias hacia self.trf_blocks para explicitar que los pesos se comparten."""
+        """Alias hacia self.trf_blocks para explicitar que los pesos se comparten sin duplicarlos en state_dict."""
         return self.trf_blocks
+
+    def step(
+        self,
+        h: torch.Tensor,
+        e: torch.Tensor,
+        t: int,
+        return_attn: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
+        """Aplica una iteración completa de los k bloques compartidos."""
+        if self.input_injection and t > 0:
+            h = h + e
+        attns: Optional[List[torch.Tensor]] = [] if return_attn else None
+        for block in self.shared_blocks:
+            if return_attn and attns is not None:
+                h, attn_w = block(h, return_attn=True)
+                attns.append(attn_w)
+            else:
+                h = block(h, return_attn=False)
+        return (h, attns) if (return_attn and attns is not None) else h
 
     def forward(
         self,
@@ -257,36 +290,45 @@ class LoopedGPT(GPTModel):
         return_attn: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, List[torch.Tensor]]]]:
         loops = self.n_loops if n_loops is None else int(n_loops)
-        x = self.embed(in_idx)
+        e = self.embed(in_idx)
+        h = e
 
-        hidden_states: List[torch.Tensor] = [x] if return_hidden else []
-        attn_maps: List[torch.Tensor] = []
+        if not return_hidden and not return_attn:
+            for t in range(loops):
+                h = self.step(h, e, t, return_attn=False)  # type: ignore[assignment]
+            return self.head(h)
 
-        for _ in range(loops):
-            for block in self.trf_blocks:
-                if return_attn:
-                    x, attn_w = block(x, return_attn=True)
-                    attn_maps.append(attn_w)
-                else:
-                    x = block(x, return_attn=False)
-                if return_hidden:
-                    hidden_states.append(x)
+        extras: Dict[str, List[torch.Tensor]] = {}
+        if return_hidden:
+            extras["hidden"] = [h]
+        if return_attn:
+            extras["attn"] = []
 
-        logits = self.head(x)
-        if return_hidden or return_attn:
-            extras: Dict[str, List[torch.Tensor]] = {}
-            if return_hidden:
-                extras["hidden"] = hidden_states
+        for t in range(loops):
             if return_attn:
-                extras["attn"] = attn_maps
-            return logits, extras
-        return logits
+                h, step_attns = self.step(h, e, t, return_attn=True)  # type: ignore[misc]
+                extras["attn"].extend(step_attns)
+            else:
+                h = self.step(h, e, t, return_attn=False)  # type: ignore[assignment]
+            if return_hidden:
+                extras["hidden"].append(h)
+
+        return self.head(h), extras
+
+
+def _infer_arch(cfg: Dict[str, Any]) -> str:
+    """Infiere la arquitectura ('gpt' o 'looped') a partir de las claves presentes en cfg."""
+    if "arch" in cfg:
+        return str(cfg["arch"])
+    if "n_loops" in cfg and "n_layers" not in cfg:
+        return "looped"
+    return "gpt"
 
 
 def build_model(cfg: Dict[str, Any]) -> nn.Module:
     """Factoría unificada que construye GPTModel o LoopedGPT a partir de un diccionario cfg."""
-    full_cfg = {**DEFAULT_MODEL_CFG, **cfg}
-    arch = full_cfg.get("arch", "gpt")
+    arch = _infer_arch(cfg)
+    full_cfg = {**DEFAULT_MODEL_CFG, **cfg, "arch": arch}
     if arch == "gpt":
         return GPTModel(full_cfg)
     if arch == "looped":
@@ -294,18 +336,26 @@ def build_model(cfg: Dict[str, Any]) -> nn.Module:
     raise ValueError(f"Arquitectura desconocida: {arch!r}. Usa 'gpt' o 'looped'.")
 
 
-def count_params(model: nn.Module, trainable_only: bool = True) -> int:
-    """Cuenta el número total de parámetros de un modelo."""
-    if trainable_only:
-        return sum(p.numel() for p in model.parameters() if p.requires_grad)
-    return sum(p.numel() for p in model.parameters())
+def count_params(
+    model: nn.Module,
+    include_embeddings: bool = True,
+    trainable_only: bool = True,
+) -> int:
+    """Cuenta el número total de parámetros del modelo (por defecto, los entrenables incluyendo embeddings)."""
+    params = (p for p in model.parameters() if (p.requires_grad or not trainable_only))
+    total = sum(p.numel() for p in params)
+    if not include_embeddings and hasattr(model, "tok_emb") and hasattr(model, "pos_emb"):
+        total -= model.tok_emb.weight.numel() + model.pos_emb.weight.numel()
+    return total
 
 
 def effective_depth(cfg: Dict[str, Any]) -> int:
-    """Profundidad computacional efectiva: L en GPT estándar, n_layers * n_loops en Looped."""
-    if cfg.get("arch", "gpt") == "gpt":
+    """Profundidad computacional efectiva: L en GPT estándar, k * N en Looped."""
+    arch = _infer_arch(cfg)
+    if arch == "gpt":
         return int(cfg["n_layers"])
-    return int(cfg.get("n_layers", 1)) * int(cfg["n_loops"])
+    k = int(cfg.get("n_unique_layers", cfg.get("n_layers", 1)))
+    return k * int(cfg["n_loops"])
 
 
 def block_flops_per_token(cfg: Dict[str, Any], seq_len: Optional[int] = None) -> int:
@@ -317,92 +367,128 @@ def block_flops_per_token(cfg: Dict[str, Any], seq_len: Optional[int] = None) ->
       Total por bloque = 24 * d^2 + 4 * T * d
     """
     d = int(cfg["emb_dim"])
-    T = int(seq_len if seq_len is not None else cfg["context_length"])
+    T = int(cfg.get("context_length", 512) if seq_len is None else seq_len)
     return 24 * (d ** 2) + 4 * T * d
 
 
-def flops_per_token(cfg: Dict[str, Any], seq_len: Optional[int] = None) -> int:
-    """FLOPs totales de forward por token incluyendo todos los pasos efectivos y la cabeza."""
+def gpt_flops_per_token(cfg: Dict[str, Any], seq_len: Optional[int] = None) -> int:
+    """FLOPs totales de forward por token para un GPTModel de L capas."""
+    L = int(cfg["n_layers"])
     d = int(cfg["emb_dim"])
-    V = int(cfg["vocab_size"])
-    steps = effective_depth(cfg)
-    return steps * block_flops_per_token(cfg, seq_len=seq_len) + 2 * d * V
+    V = int(cfg.get("vocab_size", DEFAULT_MODEL_CFG["vocab_size"]))
+    return L * block_flops_per_token(cfg, seq_len=seq_len) + 2 * d * V
+
+
+def flops_per_token(
+    cfg: Dict[str, Any],
+    seq_len: Optional[int] = None,
+    depth: Optional[int] = None,
+) -> int:
+    """FLOPs totales de forward por token incluyendo todos los pasos efectivos y la cabeza."""
+    full_cfg = {**DEFAULT_MODEL_CFG, **cfg, "arch": _infer_arch(cfg)}
+    d = int(full_cfg["emb_dim"])
+    V = int(full_cfg["vocab_size"])
+    steps = effective_depth(full_cfg) if depth is None else int(depth)
+    return steps * block_flops_per_token(full_cfg, seq_len=seq_len) + 2 * d * V
+
+
+model_flops_per_token = flops_per_token
 
 
 def gpt_cfg_from(cfg: Dict[str, Any], n_layers: int) -> Dict[str, Any]:
     """Crea una configuración de GPTModel estándar con n_layers capas."""
-    out = copy.deepcopy(cfg)
+    full_cfg = {**DEFAULT_MODEL_CFG, **cfg}
+    keys = ("vocab_size", "context_length", "emb_dim", "n_heads", "drop_rate", "qkv_bias")
+    out = {k: full_cfg[k] for k in keys}
     out["arch"] = "gpt"
     out["n_layers"] = int(n_layers)
     out["n_loops"] = 1
     return out
 
 
-def unroll_to_gpt(looped_model: LoopedGPT, n_loops: Optional[int] = None) -> GPTModel:
+@torch.no_grad()
+def unroll_to_gpt(
+    looped_model: LoopedGPT,
+    cfg: Optional[Dict[str, Any]] = None,
+    n_loops: Optional[int] = None,
+) -> GPTModel:
     """
-    Desenrolla un LoopedGPT en un GPTModel estándar de profundidad efectiva L * N
-    copiando los pesos del bloque compartido en cada capa.
+    Desenrolla un LoopedGPT en un GPTModel estándar de profundidad efectiva k * N
+    copiando los pesos de los bloques compartidos en cada capa.
     """
+    if looped_model.input_injection:
+        raise ValueError("unroll_to_gpt requiere input_injection=False")
+    base_cfg = looped_model.cfg if cfg is None else cfg
     loops = looped_model.n_loops if n_loops is None else int(n_loops)
-    total_layers = looped_model.n_layers * loops
-    gpt_cfg = gpt_cfg_from(looped_model.cfg, n_layers=total_layers)
-    gpt = GPTModel(gpt_cfg)
+    k = looped_model.n_unique_layers
+    total_layers = k * loops
+    gpt = GPTModel(gpt_cfg_from(base_cfg, n_layers=total_layers))
 
-    with torch.no_grad():
-        gpt.tok_emb.load_state_dict(looped_model.tok_emb.state_dict())
-        gpt.pos_emb.load_state_dict(looped_model.pos_emb.state_dict())
-        gpt.final_norm.load_state_dict(looped_model.final_norm.state_dict())
-        gpt.out_head.load_state_dict(looped_model.out_head.state_dict())
+    gpt.tok_emb.load_state_dict(looped_model.tok_emb.state_dict())
+    gpt.pos_emb.load_state_dict(looped_model.pos_emb.state_dict())
+    gpt.final_norm.load_state_dict(looped_model.final_norm.state_dict())
+    gpt.out_head.load_state_dict(looped_model.out_head.state_dict())
 
-        idx = 0
-        for _ in range(loops):
-            for k in range(looped_model.n_layers):
-                gpt.trf_blocks[idx].load_state_dict(
-                    looped_model.trf_blocks[k].state_dict()
-                )
-                idx += 1
+    for i in range(total_layers):
+        gpt.trf_blocks[i].load_state_dict(
+            looped_model.shared_blocks[i % k].state_dict()
+        )
     return gpt
 
 
+@torch.no_grad()
 def looped_from_gpt(
     gpt_model: GPTModel,
+    cfg: Optional[Dict[str, Any]] = None,
     n_loops: Optional[int] = None,
-    mode: str = "first",
+    init: str = "first",
+    mode: Optional[str] = None,
 ) -> LoopedGPT:
     """
-    Construye un LoopedGPT (n_layers=1) a partir de un GPTModel inicializando
-    el bloque único mediante 'first', 'last', 'middle' o 'mean'.
+    Construye un LoopedGPT a partir de un GPTModel inicializando los bloques
+    compartidos mediante 'first', 'last', 'middle', 'mean' o 'stride'.
     """
+    chosen_mode = mode if mode is not None else init
     L = len(gpt_model.trf_blocks)
-    loops = L if n_loops is None else int(n_loops)
-    loop_cfg = copy.deepcopy(gpt_model.cfg)
-    loop_cfg["arch"] = "looped"
-    loop_cfg["n_layers"] = 1
-    loop_cfg["n_loops"] = loops
-    looped = LoopedGPT(loop_cfg)
+    base_cfg = copy.deepcopy(gpt_model.cfg if cfg is None else cfg)
+    base_cfg["arch"] = "looped"
+    base_cfg.setdefault("n_unique_layers", 1)
+    base_cfg["n_layers"] = base_cfg["n_unique_layers"]
+    if n_loops is not None:
+        base_cfg["n_loops"] = int(n_loops)
+    else:
+        base_cfg.setdefault("n_loops", L)
 
-    with torch.no_grad():
-        looped.tok_emb.load_state_dict(gpt_model.tok_emb.state_dict())
-        looped.pos_emb.load_state_dict(gpt_model.pos_emb.state_dict())
-        looped.final_norm.load_state_dict(gpt_model.final_norm.state_dict())
-        looped.out_head.load_state_dict(gpt_model.out_head.state_dict())
+    looped = LoopedGPT(base_cfg)
+    looped.tok_emb.load_state_dict(gpt_model.tok_emb.state_dict())
+    looped.pos_emb.load_state_dict(gpt_model.pos_emb.state_dict())
+    looped.final_norm.load_state_dict(gpt_model.final_norm.state_dict())
+    looped.out_head.load_state_dict(gpt_model.out_head.state_dict())
 
-        if mode == "first":
-            looped.trf_blocks[0].load_state_dict(gpt_model.trf_blocks[0].state_dict())
-        elif mode == "last":
-            looped.trf_blocks[0].load_state_dict(gpt_model.trf_blocks[-1].state_dict())
-        elif mode == "middle":
-            looped.trf_blocks[0].load_state_dict(gpt_model.trf_blocks[L // 2].state_dict())
-        elif mode == "mean":
-            avg_state = copy.deepcopy(gpt_model.trf_blocks[0].state_dict())
-            for key in avg_state:
-                stacked = torch.stack(
-                    [gpt_model.trf_blocks[i].state_dict()[key].float() for i in range(L)],
-                    dim=0,
-                )
-                avg_state[key] = stacked.mean(dim=0).to(avg_state[key].dtype)
-            looped.trf_blocks[0].load_state_dict(avg_state)
-        else:
-            raise ValueError(f"Modo desconocido: {mode!r}")
+    k = looped.n_unique_layers
+    if chosen_mode == "first":
+        for j in range(k):
+            looped.shared_blocks[j].load_state_dict(gpt_model.trf_blocks[j].state_dict())
+    elif chosen_mode == "last":
+        for j in range(k):
+            looped.shared_blocks[j].load_state_dict(gpt_model.trf_blocks[L - k + j].state_dict())
+    elif chosen_mode == "middle":
+        start = max(0, (L - k) // 2)
+        for j in range(k):
+            looped.shared_blocks[j].load_state_dict(gpt_model.trf_blocks[start + j].state_dict())
+    elif chosen_mode == "stride":
+        stride = max(1, L // k)
+        for j in range(k):
+            looped.shared_blocks[j].load_state_dict(gpt_model.trf_blocks[min(j * stride, L - 1)].state_dict())
+    elif chosen_mode == "mean":
+        for j in range(k):
+            idxs = list(range(j, L, k))
+            avg_sd = {}
+            for key in gpt_model.trf_blocks[0].state_dict():
+                avg_sd[key] = sum(gpt_model.trf_blocks[i].state_dict()[key].float() for i in idxs) / len(idxs)
+                avg_sd[key] = avg_sd[key].to(gpt_model.trf_blocks[0].state_dict()[key].dtype)
+            looped.shared_blocks[j].load_state_dict(avg_sd)
+    else:
+        raise ValueError(f"Modo de inicialización desconocido: {chosen_mode!r}")
 
     return looped

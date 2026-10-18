@@ -3,7 +3,7 @@
 seeds: [0, 1, 2]
 
 defaults:
-  vocab_size: 100
+  vocab_size: 97
   context_length: 512
   emb_dim: 256
   n_heads: 8

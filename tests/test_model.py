@@ -14,6 +14,7 @@ from src.model import (
     build_model,
     count_params,
     flops_per_token,
+    looped_from_gpt,
     unroll_to_gpt,
 )
 
@@ -23,11 +24,12 @@ def _small_cfg(arch: str = "looped", n_layers: int = 1, n_loops: int = 4) -> Dic
     return {
         **DEFAULT_MODEL_CFG,
         "arch": arch,
-        "vocab_size": 100,
+        "vocab_size": DEFAULT_MODEL_CFG["vocab_size"],
         "context_length": 64,
         "emb_dim": 64,
         "n_heads": 4,
         "n_layers": n_layers,
+        "n_unique_layers": 1,
         "n_loops": n_loops,
         "drop_rate": 0.0,
         "qkv_bias": False,
@@ -37,11 +39,12 @@ def _small_cfg(arch: str = "looped", n_layers: int = 1, n_loops: int = 4) -> Dic
 def test_looped_n1_equals_gpt_l1() -> None:
     """1. Looped N = 1 da exactamente los mismos logits que GPT L = 1 con los mismos pesos."""
     torch.manual_seed(42)
+    V = DEFAULT_MODEL_CFG["vocab_size"]
     looped = build_model(_small_cfg(arch="looped", n_layers=1, n_loops=1)).eval()
     gpt = build_model(_small_cfg(arch="gpt", n_layers=1, n_loops=1)).eval()
     gpt.load_state_dict(looped.state_dict())
 
-    idx = torch.randint(0, 100, (3, 16))
+    idx = torch.randint(0, V, (3, 16))
     with torch.no_grad():
         logits_looped = looped(idx)
         logits_gpt = gpt(idx)
@@ -56,10 +59,11 @@ def test_looped_n_equals_unrolled_gpt_n(n_loops: int) -> None:
     (pesos compartidos = copias apiladas) para N = 2, 4, 8, 12.
     """
     torch.manual_seed(100 + n_loops)
+    V = DEFAULT_MODEL_CFG["vocab_size"]
     looped = build_model(_small_cfg(arch="looped", n_layers=1, n_loops=n_loops)).eval()
     gpt_unrolled = unroll_to_gpt(looped, n_loops=n_loops).eval()
 
-    idx = torch.randint(0, 100, (2, 20))
+    idx = torch.randint(0, V, (2, 20))
     with torch.no_grad():
         logits_looped, extras_looped = looped(idx, return_hidden=True, return_attn=True)
         logits_gpt, extras_gpt = gpt_unrolled(idx, return_hidden=True, return_attn=True)
@@ -84,20 +88,19 @@ def test_looped_params_invariant_to_n_loops() -> None:
 def test_causality_mask(arch: str) -> None:
     """4. Causalidad: cambiar tokens futuros no altera los logits de las posiciones anteriores."""
     torch.manual_seed(7)
+    V = DEFAULT_MODEL_CFG["vocab_size"]
     cfg = _small_cfg(arch=arch, n_layers=2 if arch == "gpt" else 1, n_loops=4)
     model = build_model(cfg).eval()
 
-    idx_a = torch.randint(0, 100, (2, 16))
+    idx_a = torch.randint(0, V, (2, 16))
     idx_b = idx_a.clone()
     cutoff = 8
-    # Modificamos todos los tokens futuros a partir de la posición `cutoff`
-    idx_b[:, cutoff:] = (idx_b[:, cutoff:] + 17) % 100
+    idx_b[:, cutoff:] = (idx_b[:, cutoff:] + 17) % V
 
     with torch.no_grad():
         logits_a = model(idx_a)
         logits_b = model(idx_b)
 
-    # Los logits hasta cutoff - 1 (inclusive) deben ser idénticos
     assert torch.allclose(logits_a[:, :cutoff, :], logits_b[:, :cutoff, :], atol=1e-6)
 
 
@@ -105,10 +108,11 @@ def test_causality_mask(arch: str) -> None:
 def test_return_hidden_and_attn_do_not_change_logits(arch: str) -> None:
     """5. Pedir return_hidden o return_attn no cambia los logits devueltos."""
     torch.manual_seed(19)
+    V = DEFAULT_MODEL_CFG["vocab_size"]
     cfg = _small_cfg(arch=arch, n_layers=3 if arch == "gpt" else 1, n_loops=4)
     model = build_model(cfg).eval()
 
-    idx = torch.randint(0, 100, (2, 14))
+    idx = torch.randint(0, V, (2, 14))
     with torch.no_grad():
         logits_plain = model(idx)
         logits_h, extras_h = model(idx, return_hidden=True, return_attn=False)
@@ -127,10 +131,11 @@ def test_return_hidden_and_attn_do_not_change_logits(arch: str) -> None:
 def test_head_on_last_hidden_equals_final_logits(arch: str) -> None:
     """6. model.head(hidden[-1]) es exactamente igual a los logits finales."""
     torch.manual_seed(23)
+    V = DEFAULT_MODEL_CFG["vocab_size"]
     cfg = _small_cfg(arch=arch, n_layers=3 if arch == "gpt" else 1, n_loops=4)
     model = build_model(cfg).eval()
 
-    idx = torch.randint(0, 100, (2, 12))
+    idx = torch.randint(0, V, (2, 12))
     with torch.no_grad():
         logits, extras = model(idx, return_hidden=True)
         logits_from_head = model.head(extras["hidden"][-1])
@@ -142,11 +147,12 @@ def test_head_on_last_hidden_equals_final_logits(arch: str) -> None:
 def test_attention_rows_sum_to_one_and_zero_above_diagonal(arch: str) -> None:
     """7. Cada fila de atención suma 1 y vale 0 por encima de la diagonal principal."""
     torch.manual_seed(31)
+    V = DEFAULT_MODEL_CFG["vocab_size"]
     cfg = _small_cfg(arch=arch, n_layers=2 if arch == "gpt" else 1, n_loops=4)
     model = build_model(cfg).eval()
 
     seq_len = 15
-    idx = torch.randint(0, 100, (2, seq_len))
+    idx = torch.randint(0, V, (2, seq_len))
     with torch.no_grad():
         _, extras = model(idx, return_attn=True)
 
@@ -180,3 +186,13 @@ def test_build_all_experiment_matrix_configs() -> None:
         with torch.no_grad():
             logits = model(idx)
         assert logits.shape == (2, 8, cfg["vocab_size"])
+
+
+@pytest.mark.parametrize("mode", ["first", "last", "middle", "mean", "stride"])
+def test_looped_from_gpt_modes(mode: str) -> None:
+    """9. Verifica la conversión looped_from_gpt en todos sus modos de inicialización."""
+    torch.manual_seed(55)
+    gpt = build_model(_small_cfg(arch="gpt", n_layers=4, n_loops=1)).eval()
+    looped = looped_from_gpt(gpt, n_loops=4, mode=mode).eval()
+    assert looped.n_loops == 4
+    assert looped.n_unique_layers == 1
